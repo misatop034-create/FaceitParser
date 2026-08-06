@@ -1,7 +1,8 @@
-﻿using FaceitParser.Abstractions;
+using FaceitParser.Abstractions;
 using FaceitParser.Data;
 using FaceitParser.Helpers;
 using FaceitParser.Services;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
@@ -48,18 +49,32 @@ namespace FaceitParser
 
         public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
         {
+            app.UseForwardedHeaders(new ForwardedHeadersOptions
+            {
+                ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+            });
+
             if (env.IsDevelopment())
             {
+                app.UseDeveloperExceptionPage();
                 app.UseMigrationsEndPoint();
             }
             else
             {
                 // The default HSTS value is 30 days. You may want to change this for production scenarios, see https://aka.ms/aspnetcore-hsts.
                 app.UseHsts();
+                app.UseExceptionHandler(errorApp =>
+                {
+                    errorApp.Run(async context =>
+                    {
+                        context.Response.StatusCode = 500;
+                        context.Response.ContentType = "text/plain";
+                        await context.Response.WriteAsync("Произошла ошибка. Попробуйте позже.");
+                    });
+                });
             }
             app.UseHttpsRedirection();
             app.UseStaticFiles();
-            app.UseHttpsRedirection();
 
             app.UseRouting();
 
