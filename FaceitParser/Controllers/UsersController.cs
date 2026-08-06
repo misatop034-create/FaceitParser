@@ -1,207 +1,97 @@
-﻿using FaceitParser.Data;
-using FaceitParser.Models;
-using FaceitParser.Models.App;
-using Microsoft.AspNetCore.Authorization;
+using FaceitParser.Abstractions;
+using FaceitParser.Data;
+using FaceitParser.Helpers;
+using FaceitParser.Services;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Identity;
-using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Identity.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore;
-using System.Text;
 
-namespace FaceitParser.Controllers
+namespace FaceitParser
 {
-    [Route("[controller]")]
-    [Authorize(Roles = "admin")]
-    public class UsersController : Controller
+    public class Startup
     {
-        private readonly UserManager<ApplicationUser> userManager;
+        public IConfiguration Configuration { get; }
 
-        private readonly RoleManager<IdentityRole> roleManager;
-
-        private readonly SignInManager<ApplicationUser> signInManager;
-
-        private readonly ApplicationDbContext context;
-
-        public UsersController(UserManager<ApplicationUser> userManager, RoleManager<IdentityRole> roleManager, SignInManager<ApplicationUser> signInManager, ApplicationDbContext dbContext)
+        public Startup(IConfiguration configuration)
         {
-            this.userManager = userManager;
-            this.roleManager = roleManager;
-            this.signInManager = signInManager;
-            this.context = dbContext;
+            Configuration = configuration;
         }
 
-        [HttpGet("login")]
-        [AllowAnonymous]
-        public IActionResult Login()
+        public void ConfigureServices(IServiceCollection services)
         {
-            if (User?.Identity?.IsAuthenticated ?? false)
-                return RedirectToAction("Index", "Home");
-            return View(new LoginViewModel());
-        }
+            var connectionString = Configuration["CONNECTION_STRING"] ?? throw new InvalidOperationException("connection string not found");
+            var steamApiKey = Configuration["STEAM_API_KEY"] ?? throw new InvalidOperationException("steam api key not found");
 
-        [HttpPost("login")]
-        [AllowAnonymous]
-        [ValidateAntiForgeryToken]
-        public async Task<IActionResult> Login(LoginViewModel model)
-        {
-            var result = await signInManager.PasswordSignInAsync(model.Username, model.Password, false, false);
-            if (result.Succeeded)
-                return RedirectToAction("Index", "Home");
-            ModelState.AddModelError(string.Empty, "Неверный логин или пароль.");
-            return View(model);
-        }
+            services.AddDbContext<ApplicationDbContext>(options =>
+                options.UseMySql(connectionString, new MySqlServerVersion(new Version(8, 0, 27))));
+            services.AddDatabaseDeveloperPageExceptionFilter();
 
-        [HttpPost("logout")]
-        [ValidateAntiForgeryToken]
-        public async Task<IActionResult> Logout()
-        {
-            await signInManager.SignOutAsync();
-            return RedirectToAction("Login");
-        }
-
-        [HttpPost("create")]
-        public async Task<IActionResult> Create([FromForm] CreateUserViewModel model)
-        {
-            if (!roleManager.Roles.Any(x => x.Name == model.Role))
-                return BadRequest(ModelState);
-            var user = new ApplicationUser() 
+            services.Configure<SecurityStampValidatorOptions>(options =>
             {
-                UserName = model.Username,
-                CreateDate = DateTimeOffset.UtcNow,
-            };
-            var result = await userManager.CreateAsync(user, model.Password);
-            if (result.Succeeded)
+                // enables immediate logout, after updating the user's security stamp.
+                options.ValidationInterval = TimeSpan.Zero;
+            });
+
+            services.AddDefaultIdentity<ApplicationUser>(options => options.SignIn.RequireConfirmedAccount = false)
+                .AddRoles<IdentityRole>()
+                .AddEntityFrameworkStores<ApplicationDbContext>();
+            services.ConfigureApplicationCookie(options =>
             {
-                var roleResult = await userManager.AddToRoleAsync(user, model.Role);
-                foreach (var error in roleResult.Errors)
+                options.Cookie.HttpOnly = true;
+                options.LoginPath = "/users/login";
+                options.AccessDeniedPath = "/";
+            });
+            services.AddSingleton<ISteamApi, SteamApi>(api => new SteamApi(steamApiKey));
+            services.AddSingleton<IServiceResolver, ServiceResolver>();
+            services.AddControllersWithViews();
+        }
+
+        public void Configure(IApplicationBuilder app, IWebHostEnvironment env)
+        {
+            app.UseForwardedHeaders(new ForwardedHeadersOptions
+            {
+                ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto
+            });
+
+            if (env.IsDevelopment())
+            {
+                app.UseDeveloperExceptionPage();
+                app.UseMigrationsEndPoint();
+            }
+            else
+            {
+                // The default HSTS value is 30 days. You may want to change this for production scenarios, see https://aka.ms/aspnetcore-hsts.
+                app.UseHsts();
+                app.UseExceptionHandler(errorApp =>
                 {
-                    ModelState.AddModelError(string.Empty, error.Description);
-                }
-            }
-            foreach (var error in result.Errors)
-            {
-                ModelState.AddModelError(string.Empty, error.Description);
-            }
-            return RedirectToAction("Users", "Users", new { Errors = ModelState.Values.SelectMany(x => x.Errors).Select(x => x.ErrorMessage) });
-        }
-
-        [HttpPost("delete")]
-        public async Task<IActionResult> Delete(string username)
-        {
-            var user = await userManager.FindByNameAsync(username);
-            var logins = await userManager.GetLoginsAsync(user);
-            var roles = await userManager.GetRolesAsync(user);
-            if (user is null)
-                return NotFound();
-            if (logins is not null)
-            {
-                foreach (var login in logins)
-                {
-                    await userManager.RemoveLoginAsync(user, login.LoginProvider, login.ProviderKey);
-                }
-            }
-            if (roles is not null)
-            {
-                foreach (var role in roles)
-                {
-                    await userManager.RemoveFromRoleAsync(user, role);
-                }
-            }
-            var blacklist = context.Blacklists.Where(x => x.UserId == user.Id).ToList();
-            if (blacklist is not null && blacklist.Any())
-            {
-                context.Blacklists.RemoveRange(blacklist);
-            }
-            var accounts = context.Accounts.Where(x => x.UserId == user.Id).ToList();
-            if (accounts is not null && accounts.Any())
-            {
-                context.Accounts.RemoveRange(accounts);
-            }
-            IdentityResult result = await userManager.DeleteAsync(user);
-            await context.SaveChangesAsync();
-            if (!result.Succeeded)
-                return NotFound();
-            return Ok(username);
-        }
-
-        [HttpPost("edit")]
-        public async Task<IActionResult> Edit([FromForm] EditUserViewmodel viewmodel)
-        {
-            var user = await userManager.FindByNameAsync(viewmodel.OldUsername);
-            if (user is null)
-                ModelState.AddModelError(string.Empty, "user not found");
-            if (viewmodel.NewUsername is not null)
-                user.UserName = viewmodel.NewUsername;
-            if (viewmodel.Password is not null)
-            {
-                var resetToken = await userManager.GeneratePasswordResetTokenAsync(user);
-                var result = await userManager.ResetPasswordAsync(user, resetToken, viewmodel.Password);
-                foreach (var error in result.Errors)
-                {
-                    ModelState.AddModelError(string.Empty, error.Description);
-                }
-            }
-            if (viewmodel.Role is not null)
-            {
-                var oldRoles = await userManager.GetRolesAsync(user);
-                var oldRole = oldRoles?.FirstOrDefault();
-                if (oldRole != viewmodel.Role)
-                {
-                    if (oldRoles is not null && oldRoles.Any())
+                    errorApp.Run(async context =>
                     {
-                        await userManager.RemoveFromRolesAsync(user, oldRoles);
-                    }
-                    var role = await roleManager.FindByNameAsync(viewmodel.Role);
-                    if (role is null)
-                        ModelState.AddModelError(string.Empty, "Role not found");
-                    else
-                        await userManager.AddToRoleAsync(user, viewmodel.Role);
-                }
+                        context.Response.StatusCode = 500;
+                        context.Response.ContentType = "text/plain";
+                        await context.Response.WriteAsync("Произошла ошибка. Попробуйте позже.");
+                    });
+                });
             }
-            await userManager.UpdateAsync(user);
-            return RedirectToAction("Users", "Users", new { Errors = ModelState.Values.SelectMany(x => x.Errors).Select(x => x.ErrorMessage) });
-        }
+            app.UseHttpsRedirection();
+            app.UseStaticFiles();
 
-        [HttpGet("dump/{username}")]
-        public async Task<IActionResult> Dump(string username)
-        {
-            var user = await userManager.FindByNameAsync(username);
-            if (user is null)
-                return NotFound();
-            var blacklist = context.Blacklists.Where(x => x.UserId == user.Id).Select(x => x.ProfileId).ToList();
-            var content = Encoding.UTF8.GetBytes(string.Join("\n", blacklist));
-            var contentType = "text/plain";
-            var fileName = $"{username}.txt";
-            return File(content, contentType, fileName);
-        }
+            app.UseRouting();
 
-        [HttpGet()]
-        public async Task<IActionResult> Users(string? search = null, int? page = 0, IEnumerable<string>? Errors = null)
-        {
-            if (Errors is not null)
+            app.UseAuthentication();
+            app.UseAuthorization();
+            app.UseEndpoints(endpoints =>
             {
-                foreach (var error in Errors)
-                    ModelState.AddModelError(string.Empty, error);
-            }
-            search = search?.ToLower();
-            var users = search is null ? userManager.Users.ToList() : userManager.Users.Where(x => x.UserName.ToLower().Contains(search)).ToList();
-            if (!users.Any())
-                return View(new List<UserViewmodel>());
-            List<UserViewmodel> vm = new List<UserViewmodel>();
-            foreach (var user in users)
-            {
-                var roles = await userManager.GetRolesAsync(user);
-                UserViewmodel userViewmodel = new UserViewmodel()
+                endpoints.MapControllers();
+                endpoints.MapFallback(async context =>
                 {
-                    UserName = user.UserName,
-                    Role = roles.Contains("admin") ? "admin" : "user",
-                    CreateDateTime = user.CreateDate.ToOffset(TimeSpan.FromHours(3)).ToString("HH:mm dd.MM.yyyy"),
-                };
-                vm.Add(userViewmodel);
-            }
-            var chunked = vm.Chunk(14).ToList();
-            if (page >= chunked.Count())
-                return RedirectToAction("Users", "Users");
-            return View(chunked[page ?? 0].ToList());
+                    context.Response.Redirect("/");
+                }); // Redirect not found maps to home page
+            });
         }
+
+
+
     }
+
 }
